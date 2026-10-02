@@ -12,6 +12,7 @@ authors:
     given-names: Edgard Uriel
     affiliation: Universidad Autónoma de Querétaro
 repository-code: https://github.com/hierax00/pectobacterium-voc-transcriptomics
+doi: 10.5281/zenodo.23095576
 license: MIT
 version: 1.0.0
 date-released: 2026-10-01
@@ -46,4 +47,3 @@ preferred-citation:
       given-names: Juan
   journal: Microorganisms
   year: 2026
-  status: submitted
