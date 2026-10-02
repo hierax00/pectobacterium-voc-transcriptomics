@@ -1,0 +1,50 @@
+---
+title: "Package Installation"
+author: "López-Chablé Edgard Uriel"
+output: html_document
+---
+
+Run this file once before the numbered analysis scripts. The analysis was
+developed under R 4.5.2 / Bioconductor 3.22; the exact package versions used
+are recorded in the `sessionInfo()` block at the end of every knitted report.
+
+```{r cran, eval = FALSE}
+cran_pkgs <- c(
+  "rmarkdown", "knitr", "tinytex",
+  "tidyverse", "viridis", "pheatmap", "cowplot", "ggrepel",
+  "igraph", "ggraph", "tidygraph",
+  "UpSetR", "plotly", "networkD3", "htmlwidgets", "webshot",
+  "magick", "pdftools"
+)
+install.packages(setdiff(cran_pkgs, rownames(installed.packages())))
+
+# LaTeX distribution for knitting to PDF, and PhantomJS for the Sankey export
+tinytex::install_tinytex()
+webshot::install_phantomjs()
+```
+
+```{r bioconductor, eval = FALSE}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+bioc_pkgs <- c(
+  "tximport", "DESeq2", "sva", "EnhancedVolcano",
+  "clusterProfiler", "enrichplot", "GO.db", "pathview",
+  "KEGGREST", "STRINGdb"
+)
+BiocManager::install(setdiff(bioc_pkgs, rownames(installed.packages())))
+```
+
+```{r check}
+pkgs <- c("tidyverse", "viridis", "pheatmap", "cowplot", "ggrepel",
+          "igraph", "ggraph", "tidygraph", "UpSetR", "plotly", "networkD3",
+          "htmlwidgets", "webshot", "magick", "pdftools",
+          "tximport", "DESeq2", "sva", "EnhancedVolcano",
+          "clusterProfiler", "enrichplot", "GO.db", "pathview",
+          "KEGGREST", "STRINGdb")
+missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) stop("Missing packages: ", paste(missing, collapse = ", "))
+data.frame(package = pkgs,
+           version = vapply(pkgs, function(p) as.character(packageVersion(p)), character(1)),
+           row.names = NULL)
+```

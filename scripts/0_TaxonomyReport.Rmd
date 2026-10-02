@@ -1,0 +1,156 @@
+---
+title: "Taxonomy Report"
+author: "López-Chablé Edgard Uriel"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: readable
+    highlight: zenburn
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, message = FALSE, warning = FALSE}
+# Load necessary libraries
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(plotly)
+library(networkD3)
+library(htmlwidgets)
+library(webshot)
+library(magick)
+```
+
+## 1. Data Import and Preprocessing
+
+We import the Kraken2 taxonomy report and perform initial cleanup, such as removing leading/trailing whitespaces from the taxon names.
+
+```{r data_import}
+# Create output directory for high-res figures
+out_dir <- "../results/taxonomy"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Read Kraken2 report
+kraken_data <- read.delim("../data/taxonomy/reporte_taxonomia.txt",
+                          header = FALSE, 
+                          sep = "\t", 
+                          col.names = c("Percentage", "Clade_Reads", "Taxon_Reads", 
+                                        "Rank", "TaxID", "Name"))
+
+# Clean up whitespace used by Kraken for indentation
+kraken_data <- kraken_data %>%
+  mutate(Name = str_trim(Name))
+
+head(kraken_data)
+```
+
+---
+
+## 2. Global Species Abundance
+
+We filter the data strictly to the Species level (Rank 'S') to visualize the top 10 most abundant species in our sample.
+
+```{r relative_abundance_bar}
+# Filter and sort for the top 10 species
+bar_data <- kraken_data %>%
+  filter(Rank == "S") %>%
+  arrange(desc(Percentage)) %>%
+  head(10)
+
+# Create the bar plot
+p_bar <- ggplot(bar_data, aes(x = reorder(Name, Percentage), y = Percentage, fill = Name)) +
+  geom_bar(stat = "identity", color = "black", show.legend = FALSE) +
+  coord_flip() + 
+  theme_minimal() +
+  labs(title = "Relative Species Abundance in Control Sample",
+       subtitle = "Taxonomic classification based on k-mers (Kraken2)",
+       x = "Identified Species",
+       y = "Percentage of Reads (%)") +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "#2c3e50"),
+    plot.subtitle = element_text(size = 12, color = "#7f8c8d"),
+    axis.text.y = element_text(face = "italic", size = 12, color = "black")
+  ) +
+  scale_fill_viridis_d(option = "mako", direction = -1)
+
+p_bar
+
+# Export to PDF and 600 DPI TIFF
+ggsave(filename = paste0(out_dir, "/barplot_taxonomy.pdf"), plot = p_bar, width = 10, height = 8)
+ggsave(filename = paste0(out_dir, "/barplot_taxonomy.tiff"), plot = p_bar, width = 10, height = 8, dpi = 600, compression = "lzw")
+```
+
+---
+
+## 3. Lowest Common Ancestor (LCA) Read Distribution
+
+Not all reads assigned to the Genus level can be resolved to a specific Species. This Sankey diagram visualizes the flow of reads and highlights the proportion of sequences conserved at the Genus level due to the LCA algorithm.
+
+```{r lca_sankey}
+# Extract total reads for the Pectobacterium genus
+genus_reads <- kraken_data %>% 
+  filter(Rank == "G" & Name == "Pectobacterium") %>% 
+  pull(Clade_Reads)
+
+# Extract breakdown of specific Pectobacterium species
+species_data <- kraken_data %>% 
+  filter(Rank == "S" & grepl("Pectobacterium", Name)) %>%
+  select(Name, Clade_Reads)
+
+# Calculate remaining reads (LCA algorithm resolution limit)
+sum_species <- sum(species_data$Clade_Reads)
+unclassified_reads <- genus_reads - sum_species
+
+# Build Sankey Links
+links <- data.frame(
+  source = rep("Pectobacterium (Total Genus)", nrow(species_data) + 1),
+  target = c(species_data$Name, "Conserved at Genus Level (LCA)"),
+  value = c(species_data$Clade_Reads, unclassified_reads)
+)
+
+# Build Nodes and assign numerical IDs required by networkD3
+nodes <- data.frame(name = unique(c(links$source, links$target)))
+
+links$IDsource <- match(links$source, nodes$name) - 1 
+links$IDtarget <- match(links$target, nodes$name) - 1
+
+# Draw interactive Sankey Network
+sankey_plot <- sankeyNetwork(Links = links, Nodes = nodes,
+                             Source = "IDsource", Target = "IDtarget",
+                             Value = "value", NodeID = "name",
+                             units = " Reads", 
+                             fontSize = 14, nodeWidth = 30, 
+                             sinksRight = FALSE, 
+                             margin = list(left = 50, right = 50))
+
+sankey_plot
+
+# Export Interactive Sankey to Static High-Res Formats
+# 1. Save as temporary HTML
+saveWidget(sankey_plot, "temp_sankey.html", selfcontained = FALSE)
+
+# 2. Capture as PDF
+webshot("temp_sankey.html", file = paste0(out_dir, "/sankey_lca.pdf"))
+
+# 3. Read PDF and render as 600 DPI TIFF using magick
+img_sankey <- image_read_pdf(paste0(out_dir, "/sankey_lca.pdf"), density = 600)
+image_write(img_sankey, paste0(out_dir, "/sankey_lca.tiff"), format = "tiff")
+
+# Clean up temporary HTML files
+unlink(c("temp_sunburst.html", "temp_sankey.html", "temp_sunburst_files", "temp_sankey_files"), recursive = TRUE)
+```
+
+---
+
+## Session Information
+```{r session_info}
+sessionInfo()
+```
+
+

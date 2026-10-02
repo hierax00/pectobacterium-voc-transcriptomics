@@ -1,0 +1,182 @@
+---
+title: "Exploratory Analysis"
+author: "López-Chablé Edgard Uriel"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: readable
+    highlight: zenburn
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, message = FALSE, warning = FALSE}
+# Load necessary packages
+library(cowplot)
+library(viridis)
+library(tximport)
+library(DESeq2)
+library(tidyverse)
+library(ggrepel)
+
+# TIFF output directory (created automatically)
+tiff_dir <- "../results/TIFFs/1_ExploratoryAnalysis"
+dir.create(tiff_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+## 1. Import files and preprocess data
+
+### 1.1. Import count files (Kallisto)
+We set the path and pattern for the Kallisto files to load the counts.
+
+```{r import_counts}
+files <- list.files(full.names = TRUE, 
+                    path = "../data/counts", 
+                    pattern = "*.tsv")
+files
+```
+
+### 1.2. Import experimental metadata
+We load the metadata, which contains the conditions and replicates for our experiment.
+
+```{r import_metadata}
+metadatos <- read.csv(file = "../data/metadata_all.csv", row.names = 1)
+head(metadatos)
+```
+
+**Quality check:** We verify if the number of count files matches the number of samples in our metadata.
+```{r check_match}
+length(files) == nrow(metadatos)
+```
+
+### 1.3. Build the tx2gene object
+Since we are working with bacteria (*Pectobacterium*), there is no complex alternative splicing. Because of this, the transcript name is the same as the gene name. 
+
+*Note: We read the first count file to get the gene IDs without using absolute local paths.*
+
+```{r build_tx2gene}
+kallisto_ejemplo <- read.delim(files[1])
+
+tx2gene <- data.frame(
+  TXNAME = kallisto_ejemplo$target_id,
+  GENEID = kallisto_ejemplo$target_id
+)
+```
+
+### 1.4. Import with tximport and create DESeq2 object
+We merge the counts and set up the `DESeqDataSet` object, using `Condition` as our main experimental variable.
+
+```{r run_tximport}
+txi.kallisto <- tximport(files, 
+                         type = "kallisto", 
+                         tx2gene = tx2gene) 
+
+dds <- DESeqDataSetFromTximport(txi.kallisto, 
+                                colData = metadatos, 
+                                design = ~ Condition)
+dds
+```
+
+### 1.5. Extract and filter counts
+To improve our statistical results and reduce noise, we remove genes with low expression. We only keep genes that have an average of more than 10 counts across all samples.
+
+```{r raw_and_filtered_counts}
+# 1. Extract and save raw counts
+rawcounts <- as.matrix(counts(dds))
+head(rawcounts)
+write.csv(rawcounts, file = "../results/rawcounts.csv", row.names = TRUE)
+
+# 2. Filter low expression genes
+filtcounts <- rawcounts[rowMeans(rawcounts) > 10, ]
+head(filtcounts)
+
+# 3. Calculate the percentage of genes kept
+p <- (nrow(filtcounts) / nrow(rawcounts)) * 100
+paste("Expressed genes kept after filtering =", round(p, 2), "%")
+
+write.csv(filtcounts, file = "../results/filtcounts.csv", row.names = TRUE)
+```
+
+We update our `DESeqDataSet` object to only use the genes we kept.
+
+```{r update_dds}
+expgen <- rownames(filtcounts)
+dds <- dds[expgen, ]
+dds
+```
+
+---
+
+## 2. Exploratory data analysis
+
+### 2.1. Variance Stabilizing Transformation (VST)
+We apply the VST to normalize the data. This makes the variance independent of the mean, which helps clustering methods like PCA work better.
+
+```{r vst_transformation}
+vsd <- vst(dds, blind = FALSE)
+```
+
+### 2.2. Principal Component Analysis (PCA)
+We calculate and plot the PCA to see how similar the samples are and check if they group by their experimental condition.
+
+```{r pca_calculation}
+# Get coordinates and explained variance
+pcaData <- plotPCA(vsd, intgroup = "Condition", returnData = TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+paste("Total explained variance (PC1 + PC2) =", sum(percentVar), "%")
+```
+
+Create and save the PCA plot:
+
+```{r pca_plot, fig.width=11, fig.height=8.5}
+# Consistent palette: blue = Control, red = Treatment
+pca_palette <- c("Control" = "#4575B4", "Treatment" = "#D73027")
+
+pca <- ggplot(pcaData,
+              aes(x = PC1, y = PC2,
+                  color = Condition, shape = Condition)) +
+  geom_point(size = 7, alpha = 0.85) +
+  # circle (16) for Control, filled triangle (17) for Treatment — same in all PCAs
+  scale_shape_manual(values = c("Control" = 16, "Treatment" = 17),
+                     name = "Condition") +
+  scale_color_manual(values = pca_palette, name = "Condition") +
+  geom_text_repel(aes(label = name), show.legend = FALSE,
+                  size = 4, fontface = "bold",
+                  box.padding = 0.5, bg.color = "white", bg.r = 0.1) +
+  labs(title    = "PCA of Pectobacterium, Treatment vs Control",
+       subtitle  = "Filtered and VST normalized data",
+       x = paste0("PC1: ", percentVar[1], "% variance"),
+       y = paste0("PC2: ", percentVar[2], "% variance")) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold", size = 14)) +
+  coord_fixed()
+
+pca
+
+# Save the plot in high quality
+ggsave(filename = "../results/pca_raw.pdf", plot = pca, width = 11, height = 8.5)
+ggsave(filename = file.path(tiff_dir, "pca_raw.tiff"), plot = pca, width = 11, height = 8.5, dpi = 300, compression = "lzw")
+```
+
+### 2.3. Save workspace
+We save the objects in an `.RData` file so we can easily use them in future scripts without running everything again.
+
+```{r save_rdata}
+save(metadatos, dds, rawcounts, filtcounts, pca, file = "../results/dds.RData")
+```
+
+---
+
+## Session information
+Recording the R version and packages used helps make sure this analysis can be reproduced.
+
+```{r session_info}
+sessionInfo()
+```

@@ -1,0 +1,576 @@
+---
+title: "Paper Figures (High-Resolution, 1200 dpi)"
+author: "López-Chablé Edgard Uriel"
+output:
+  pdf_document:
+    toc: true
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: false
+    theme: readable
+    highlight: zenburn
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 0. Purpose
+
+This script regenerates the final set of figures selected for the manuscript, exported at
+**1200 dpi** into a dedicated `results/paper_images` folder. It reuses the objects already
+computed by scripts `3_DifferentialExpression.Rmd`, `4_FunctionalCategorization.Rmd`, and
+`5_AdvancedAnalysis.Rmd` — run those first if the intermediate files listed below are missing.
+
+Figures produced:
+
+1. Volcano plot — all genes (Treatment vs Control)
+2. KEGG pathway enrichment (GSEA ridgeplot, "Photosynthesis" pathways excluded)
+3. Protein-protein interaction (PPI) network, high confidence (STRING score > 700)
+4. Volcano plot — virulence-associated genes highlighted
+5. Heatmap — virulence-associated genes
+6. Volcano plot — transcriptional regulators highlighted
+
+```{r libraries, message = FALSE, warning = FALSE}
+library(DESeq2)
+library(EnhancedVolcano)
+library(tidyverse)
+library(pheatmap)
+library(viridis)
+library(ggrepel)
+library(clusterProfiler)
+library(enrichplot)
+library(KEGGREST)
+library(STRINGdb)
+library(igraph)
+library(ggraph)
+library(tidygraph)
+library(magick)
+library(pdftools)
+
+# Dedicated output folder for final paper figures (1200 dpi)
+paper_dir <- "../results/paper_images"
+dir.create(paper_dir, showWarnings = FALSE, recursive = TRUE)
+
+DPI <- 1200
+
+# Consistent condition color palette (used across all plots)
+pal_control   <- "#4575B4"
+pal_treatment <- "#D73027"
+cond_palette  <- c("Control" = pal_control, "Treatment" = pal_treatment)
+pal_diverging <- colorRampPalette(c("#4575B4", "white", "#D73027"))(100)
+```
+
+---
+
+## 1. Load required intermediate data
+
+```{r load_data, message = FALSE, warning = FALSE}
+# Full DESeq2 results table (all genes, script 3)
+res <- read.csv("../results/deseq_results_Treatment_vs_Control.csv", row.names = 1)
+
+# Strict DEG subset (script 3)
+deg_table <- read_csv("../results/deg_Treatment_vs_Control.csv", show_col_types = FALSE) %>%
+  rename(GeneID_full = ...1) %>%
+  mutate(GeneID = str_extract(GeneID_full, "WP_[0-9]+\\.[0-9]+"))
+all_deg_ids <- trimws(deg_table$GeneID)
+
+# Full annotated results (all genes + eggNOG, script 4)
+full_annotation <- read_csv("../results/advanced_analysis/full_annotated_results.csv",
+                            show_col_types = FALSE)
+
+# eggNOG annotation (KEGG dictionary source)
+eggnog_data <- read.delim("../data/annotation.tsv")
+
+# Metadata and normalized counts (needed for the virulence heatmap)
+metadatos <- read.csv(file = "../data/metadata_all.csv", row.names = 1)
+load(file = "../results/dds_norm.RData")
+normcounts <- counts(dds_norm, normalized = TRUE)
+colnames(normcounts) <- metadatos$Replicates
+
+# Gene-name label map (long ID -> short name, e.g. pelA)
+label_map <- full_annotation %>%
+  filter(!is.na(Preferred_name), !Preferred_name %in% c("NA", "-", "")) %>%
+  dplyr::select(GeneID, Preferred_name) %>%
+  distinct(GeneID, .keep_all = TRUE)
+
+short_wp <- function(x) str_extract(x, "WP_[0-9]+\\.[0-9]+")
+make_labels <- function(long_ids) {
+  wp <- short_wp(long_ids)
+  labels <- ifelse(wp %in% label_map$GeneID,
+                   label_map$Preferred_name[match(wp, label_map$GeneID)],
+                   wp)
+  labels[is.na(labels)] <- wp[is.na(labels)]
+  labels
+}
+
+# Virulence factors table (script 5_AdvancedAnalysis)
+virulence_df <- read_csv("../results/advanced_analysis/virulence_factors_table.csv",
+                         show_col_types = FALSE)
+virulence_genes <- virulence_df$GeneID
+```
+
+---
+
+## 2. Figure 1 — Volcano Plot: All Genes
+
+```{r fig1_volcano_all, fig.width=11, fig.height=8.5, warning=FALSE}
+row_labels <- make_labels(rownames(res))
+sig_mask   <- !is.na(res$padj) & res$padj < 0.01 & abs(res$log2FoldChange) > 1
+
+# --- Mixed ranking: combines significance (padj) and magnitude (log2FC) ---
+# Uses rank() instead of raw normalized values, since many genes share the
+# same clamped padj (~0), which would otherwise distort a min-max score.
+# Takes pmin(rank_padj, rank_lfc) instead of summing, so a gene qualifies
+# if it stands out strongly on EITHER axis — this prevents the hundreds of
+# padj-clamped genes from dominating the selection and crowding out genes
+# that are extreme only in log2FC.
+N_TOP_LABELS <- 20
+
+rank_df <- res[sig_mask, ] %>%
+  as.data.frame() %>%
+  rownames_to_column("GeneID_full") %>%
+  mutate(
+    neglog10_padj = -log10(padj),
+    abs_lfc       = abs(log2FoldChange),
+    rank_padj     = rank(neglog10_padj, ties.method = "average"),
+    rank_lfc      = rank(abs_lfc, ties.method = "average"),
+    best_rank     = pmin(rank_padj, rank_lfc)
+  ) %>%
+  arrange(desc(best_rank)) %>%
+  slice_head(n = N_TOP_LABELS)
+
+# --- Extra rule: always label genes with a very large fold change ---
+# Independent of the ranking above, any significant gene whose |log2FC|
+# exceeds this threshold gets labeled too, so large-effect outliers are
+# never dropped just for missing the top-N cutoff.
+FC_LABEL_THRESHOLD <- 2
+
+fc_extreme_ids <- res[sig_mask, ] %>%
+  as.data.frame() %>%
+  rownames_to_column("GeneID_full") %>%
+  filter(abs(log2FoldChange) > FC_LABEL_THRESHOLD) %>%
+  pull(GeneID_full)
+
+# --- Build a position-matched label vector (avoids selectLab name-collision) ---
+# selectLab in EnhancedVolcano matches by label TEXT, so if two different
+# rows share the same short gene symbol (e.g. two entries both mapping to
+# "cysG"), it labels every occurrence of that text — including
+# non-significant duplicates elsewhere in the table. Instead, we blank out
+# all labels except the exact selected rows, matched by GeneID (rowname).
+top_ids <- union(rank_df$GeneID_full, fc_extreme_ids)
+plot_labels <- ifelse(rownames(res) %in% top_ids, row_labels, "")
+
+volc_all <- EnhancedVolcano(res,
+               lab             = plot_labels,
+               selectLab       = plot_labels[plot_labels != ""],
+               x               = "log2FoldChange",
+               y               = "padj",
+               axisLabSize     = 12,
+               pCutoff         = 0.01,
+               FCcutoff        = 1,
+               col             = c("#BDBDBD", "#FDAE61", "#74ADD1", "#1A9641"),
+               colAlpha        = 0.75,
+               pointSize       = 2.5,
+               title           = "Volcano Plot",
+               titleLabSize    = 14,
+               subtitle        = "Treatment vs Control — All Genes",
+               subtitleLabSize = 11,
+               captionLabSize  = 9,
+               labSize         = 3.2,
+               labFace         = "bold",
+               labCol          = "black",
+               legendLabels    = c("NS", "|log2FC| > 1", "adj-p < 0.01", "DEG"),
+               legendPosition  = "right",
+               legendLabSize   = 11,
+               legendIconSize  = 4,
+               drawConnectors  = TRUE,
+               widthConnectors = 0.4,
+               colConnectors   = "grey50",
+               border          = "full",
+               borderWidth     = 0.6,
+               gridlines.major = TRUE,
+               gridlines.minor = FALSE)
+volc_all
+ggsave(filename = file.path(paper_dir, "Fig1_Volcano_AllGenes.tiff"),
+       plot = volc_all, width = 11, height = 8.5, dpi = DPI, compression = "lzw")
+```
+
+---
+
+## 3. Figure 2 — KEGG Pathway Enrichment (GSEA Ridgeplot)
+
+We run a Gene Set Enrichment Analysis (GSEA) over the full ranked gene list (by log2FoldChange)
+against KEGG pathways, then plot the result as a ridgeplot. The "Photosynthesis" pathway(s) are
+excluded from the plot, since they are not biologically relevant for this comparison.
+
+```{r fig2_kegg, fig.width=10, fig.height=8, warning=FALSE, message=FALSE}
+term2gene_kegg <- eggnog_data %>%
+  dplyr::select(KEGG_Pathway, X.query) %>%
+  tidyr::separate_rows(KEGG_Pathway, sep = ",") %>%
+  dplyr::filter(KEGG_Pathway != "" & KEGG_Pathway != "-" & !is.na(KEGG_Pathway)) %>%
+  dplyr::filter(grepl("map", KEGG_Pathway)) %>%
+  dplyr::mutate(query = trimws(X.query), KEGG_Pathway = trimws(KEGG_Pathway)) %>%
+  dplyr::select(KEGG_Pathway, X.query) %>%
+  as.data.frame()
+
+# Official KEGG pathway names, used as TERM2NAME for GSEA
+kegg_names <- keggList("pathway")
+term2name_kegg <- data.frame(
+  PathwayID   = sub("path:", "", names(kegg_names)),
+  PathwayName = as.character(kegg_names)
+)
+term2name_kegg$PathwayName <- gsub(" - Reference pathway", "", term2name_kegg$PathwayName)
+
+# Build the ranked gene list (by log2FoldChange) required for GSEA
+gsea_ranked <- full_annotation %>%
+  filter(!is.na(GeneID) & !is.na(log2FoldChange)) %>%
+  group_by(GeneID) %>%
+  slice_max(order_by = abs(log2FoldChange), n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+gsea_vector <- gsea_ranked$log2FoldChange
+names(gsea_vector) <- gsea_ranked$GeneID
+gsea_vector <- sort(gsea_vector, decreasing = TRUE)
+
+set.seed(124)
+gsea_kegg <- GSEA(geneList = gsea_vector,
+                  TERM2GENE = term2gene_kegg,
+                  TERM2NAME = term2name_kegg,
+                  pvalueCutoff = 0.05,
+                  pAdjustMethod = "BH",
+                  minGSSize = 10,
+                  maxGSSize = 500,
+                  eps = 0,
+                  seed = TRUE)   # reproducible permutations (uses set.seed above)
+
+# Drop any "Photosynthesis" pathways (case-insensitive) before plotting
+gsea_kegg_filtered <- gsea_kegg
+gsea_kegg_filtered@result <- gsea_kegg_filtered@result %>%
+  dplyr::filter(!str_detect(tolower(Description), "photosynthesis"))
+
+p_kegg_ridge <- ridgeplot(gsea_kegg_filtered, showCategory = 15) +
+  labs(title = "KEGG Pathway Enrichment (GSEA)",
+       x = "Enrichment Distribution (log2FoldChange)") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title   = element_text(face = "bold", size = 14),
+        axis.text.y  = element_text(size = 10),
+        axis.text.x  = element_text(size = 10),
+        legend.title = element_text(size = 10))
+p_kegg_ridge
+
+ggsave(filename = file.path(paper_dir, "Fig2_KEGG_Enrichment_Ridgeplot.tiff"),
+       plot = p_kegg_ridge, width = 10, height = 8, dpi = DPI, compression = "lzw")
+```
+
+---
+
+## 4. Figure 3 — Protein-Protein Interaction (PPI) Network
+
+```{r fig3_ppi_build, warning=FALSE, message=FALSE}
+deg_network <- full_annotation %>%
+  filter(padj < 0.05) %>%
+  dplyr::select(GeneID, Preferred_name, seed_ortholog, log2FoldChange) %>%
+  mutate(search_name = coalesce(Preferred_name, GeneID)) %>%
+  group_by(search_name) %>%
+  slice_max(order_by = abs(log2FoldChange), n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+valid_orthologs <- deg_network$seed_ortholog[!is.na(deg_network$seed_ortholog) &
+                                             deg_network$seed_ortholog != ""]
+tax_id <- as.numeric(strsplit(valid_orthologs[1], "\\.")[[1]][1])
+
+string_db <- STRINGdb$new(version = "11.5", species = tax_id, score_threshold = 700)
+mapped_genes <- string_db$map(as.data.frame(deg_network), "search_name", removeUnmappedRows = TRUE)
+interactions <- string_db$get_interactions(mapped_genes$STRING_id)
+
+ppi_graph <- graph_from_data_frame(d = interactions, directed = FALSE)
+ppi_graph <- simplify(ppi_graph)
+
+if (vcount(ppi_graph) > 0) {
+  # Louvain is stochastic: without a seed, module membership (and therefore the
+  # per-module hub selection below) varies between runs. Seed 124 reproduces the
+  # hub set shown in the published figure; 13 of the 15 hubs are stable across seeds.
+  set.seed(124)
+  communities <- cluster_louvain(ppi_graph)
+  ppi_graph <- set_vertex_attr(ppi_graph, "cluster", value = as.numeric(membership(communities)))
+  ppi_graph <- set_vertex_attr(ppi_graph, "degree", value = degree(ppi_graph))
+  ppi_graph <- set_vertex_attr(ppi_graph, "betweenness", value = betweenness(ppi_graph))
+
+  node_metadata <- data.frame(STRING_id = V(ppi_graph)$name) %>%
+    left_join(mapped_genes, by = "STRING_id") %>%
+    distinct(STRING_id, .keep_all = TRUE)
+
+  ppi_graph <- set_vertex_attr(ppi_graph, "label", value = node_metadata$search_name)
+  ppi_graph <- set_vertex_attr(ppi_graph, "log2FC", value = node_metadata$log2FoldChange)
+
+  top_hubs <- node_metadata %>%
+    mutate(Degree = V(ppi_graph)$degree,
+           Betweenness = V(ppi_graph)$betweenness,
+           Cluster = V(ppi_graph)$cluster) %>%
+    group_by(Cluster) %>%
+    slice_max(order_by = Betweenness, n = 3, with_ties = FALSE) %>%
+    ungroup() %>%
+    arrange(desc(Betweenness)) %>%
+    head(15)
+} else {
+  message("STRINGdb could not find any interactions above the 700 threshold.")
+}
+```
+
+```{r fig3_ppi_plot, fig.width=12, fig.height=12, warning=FALSE}
+if (vcount(ppi_graph) > 0) {
+  net_components <- components(ppi_graph)
+  if (max(net_components$csize) > 1) {
+    main_component <- induced_subgraph(
+      ppi_graph, vids = which(net_components$membership == which.max(net_components$csize)))
+
+    tidy_net <- as_tbl_graph(main_component) %>%
+      mutate(
+        is_hub            = name %in% top_hubs$STRING_id,
+        hub_label         = ifelse(is_hub, label, NA),
+        clean_betweenness = replace_na(betweenness, 0),
+        max_bet           = max(clean_betweenness, na.rm = TRUE),
+        node_size         = ifelse(max_bet > 0, (clean_betweenness / max_bet) * 10 + 3, 5)
+      )
+
+    p_net <- ggraph(tidy_net, layout = "kk") +
+      geom_edge_link(color = "grey85", width = 0.5, alpha = 0.6) +
+      geom_node_point(aes(size = node_size, color = as.factor(cluster), alpha = is_hub)) +
+      scale_alpha_manual(values = c("TRUE" = 1, "FALSE" = 0.4), guide = "none") +
+      geom_node_text(aes(label = hub_label),
+                     repel = TRUE, fontface = "bold", size = 5,
+                     box.padding = 1, point.padding = 0.5, max.overlaps = Inf,
+                     bg.color = "white", bg.r = 0.15,
+                     segment.color = "grey40", segment.size = 0.6) +
+      # --- Color legend: Louvain clusters are shown as visual grouping only,
+      # not as biologically meaningful modules. Title reflects this so the
+      # reader doesn't over-interpret the color as functional annotation. ---
+      scale_color_viridis_d(option = "viridis", name = "Network module\n(visual grouping)",
+                            labels = NULL, guide = guide_legend(
+                              override.aes = list(size = 5),
+                              label = FALSE,
+                              keywidth = 0.6)) +
+      # --- Size legend: betweenness centrality, shown as real continuous values ---
+      scale_size_continuous(name = "Betweenness\ncentrality",
+                            range = c(1.5, 11),
+                            breaks = scales::breaks_pretty(n = 4)) +
+      labs(title    = "Protein-Protein Interaction Network",
+           subtitle = "Top 15 Bottleneck Hubs Highlighted (High Confidence STRING Score > 700)",
+           # --- Clarifying caption: the analytical focus of this figure is
+           # bottleneck identification (betweenness), not the cluster
+           # colors, which only separate the network visually. ---
+           caption  = "Node color denotes Louvain clusters used for visual separation only\nand does not imply shared biological function. Labeled nodes are the\ntop 15 bottleneck hubs by betweenness centrality.") +
+      theme_void() +
+      theme(legend.position = "right",
+            legend.title    = element_text(face = "bold", size = 11),
+            legend.text     = element_text(size = 9),
+            legend.spacing  = unit(0.6, "cm"),
+            plot.title      = element_text(face = "bold", size = 18, hjust = 0.5),
+            plot.subtitle   = element_text(size = 14, hjust = 0.5, color = "grey40"),
+            plot.caption    = element_text(size = 9, color = "grey40", hjust = 0.5,
+                                           margin = margin(t = 10)),
+            plot.margin     = margin(10, 10, 10, 10))
+
+    # Render once as a high-res PDF, then rasterize to TIFF at 1200 dpi
+    pdf_path  <- file.path(paper_dir, "Fig3_PPI_Network_tmp.pdf")
+    tiff_path <- file.path(paper_dir, "Fig3_PPI_Network.tiff")
+
+    pdf(pdf_path, width = 12, height = 12)
+    print(p_net)
+    dev.off()
+
+    image_write(
+      image_read_pdf(pdf_path, density = DPI),
+      path = tiff_path, format = "tiff", compression = "lzw"
+    )
+    file.remove(pdf_path)
+
+    print(p_net)
+  } else {
+    message("No connected components found to draw the plot.")
+  }
+} else {
+  message("Plot cancelled: the network is empty.")
+}
+```
+
+---
+
+## 5. Figure 4 — Volcano Plot: Virulence Genes Highlighted
+
+```{r fig4_virulence_volcano, fig.width=10, fig.height=8, warning=FALSE}
+# Functional keywords are searched in the eggNOG description; the gene-family
+# prefixes (pel, peh, out, kdg) are matched only at the start of the gene name,
+# so that e.g. "out" does not capture every "outer membrane" protein.
+virulence_desc_kw <- "pectate lyase|cellulase|protease|secretion system"
+virulence_name_kw <- "^(pel|peh|out|kdg)"
+
+# --- Relaxed significance cutoffs for virulence highlighting ---
+# Original cutoffs (padj < 0.05, |log2FC| > 1 / 2-fold) were too strict and
+# left almost all virulence-associated genes in the "NS" (not significant)
+# bucket even when they showed meaningful shifts. Relaxed to the standard
+# 1.5-fold change threshold (log2(1.5) ≈ 0.585) and a more permissive
+# padj < 0.1, so more biologically relevant virulence genes are highlighted.
+VIR_FC_CUTOFF   <- 0.585
+VIR_PADJ_CUTOFF <- 0.1
+
+virulence_volcano_data <- full_annotation %>%
+  mutate(
+    Is_Virulence = if_else(
+      str_detect(tolower(Description), virulence_desc_kw) |
+        str_detect(tolower(Preferred_name), virulence_name_kw), "Yes", "No"),
+    Category = case_when(
+      Is_Virulence == "Yes" & !is.na(padj) & padj < VIR_PADJ_CUTOFF & log2FoldChange >  VIR_FC_CUTOFF ~ "Virulence ↑ in Treatment",
+      Is_Virulence == "Yes" & !is.na(padj) & padj < VIR_PADJ_CUTOFF & log2FoldChange < -VIR_FC_CUTOFF ~ "Virulence ↓ in Treatment",
+      Is_Virulence == "Yes"                                                                            ~ "Virulence (NS)",
+      TRUE                                                                                              ~ "Background"
+    ),
+    Label = if_else(
+      Is_Virulence == "Yes" & !is.na(padj) & padj < VIR_PADJ_CUTOFF & abs(log2FoldChange) > VIR_FC_CUTOFF,
+      coalesce(
+        na_if(Preferred_name, "-"),
+        str_extract(GeneID, "WP_[0-9]+\\.[0-9]+"),
+        GeneID),
+      NA_character_)
+  )
+
+vir_colors <- c("Background"                = "#BDBDBD",
+                "Virulence (NS)"            = "#A6D96A",
+                "Virulence ↑ in Treatment"   = "#D73027",
+                "Virulence ↓ in Treatment" = "#4575B4")
+vir_sizes  <- c("Background" = 1.2, "Virulence (NS)" = 2.5,
+                "Virulence ↑ in Treatment" = 3.5, "Virulence ↓ in Treatment" = 3.5)
+vir_alpha  <- c("Background" = 0.35, "Virulence (NS)" = 0.65,
+                "Virulence ↑ in Treatment" = 1, "Virulence ↓ in Treatment" = 1)
+
+p_vir_volcano <- ggplot(virulence_volcano_data, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = Category, size = Category, alpha = Category)) +
+  scale_color_manual(values = vir_colors, name = NULL) +
+  scale_size_manual( values = vir_sizes,  name = NULL) +
+  scale_alpha_manual(values = vir_alpha,  name = NULL) +
+  geom_text_repel(data = ~ filter(.x, !is.na(Label)),
+                  aes(label = Label),
+                  size = 3.5, fontface = "bold",
+                  box.padding = 0.5, point.padding = 0.3,
+                  max.overlaps = Inf,
+                  color = "black", bg.color = "white", bg.r = 0.12,
+                  segment.color = "grey50", segment.size = 0.4) +
+  geom_vline(xintercept = c(-VIR_FC_CUTOFF, VIR_FC_CUTOFF), linetype = "dashed",
+             color = "grey30", alpha = 0.6, linewidth = 0.5) +
+  geom_hline(yintercept = -log10(VIR_PADJ_CUTOFF), linetype = "dashed",
+             color = "grey30", alpha = 0.6, linewidth = 0.5) +
+  labs(title    = "Virulence-Associated Genes",
+       subtitle = "Red = higher in Treatment (log2FC > 0) · Blue = higher in Control (log2FC < 0)",
+       x = "log₂ Fold Change  (Treatment / Control)",
+       y = "-log₁₀(adj. p-value)") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title       = element_text(face = "bold", size = 15),
+        plot.subtitle    = element_text(size = 10, color = "grey40"),
+        panel.grid.minor = element_blank(),
+        legend.position  = "right")
+p_vir_volcano
+ggsave(filename = file.path(paper_dir, "Fig4_Volcano_VirulenceGenes.tiff"),
+       plot = p_vir_volcano, width = 10, height = 8, dpi = DPI, compression = "lzw")
+```
+
+---
+
+## 6. Figure 5 — Heatmap: Virulence Genes
+
+```{r fig5_virulence_heatmap, fig.width=8, fig.height=10, warning=FALSE}
+rownames(normcounts) <- str_extract(rownames(normcounts), "WP_[0-9]+\\.[0-9]+")
+normcounts_clean <- normcounts[!is.na(rownames(normcounts)), ]
+
+virulence_matrix <- normcounts_clean[virulence_genes, ]
+rownames(virulence_matrix) <- ifelse(!is.na(virulence_df$Preferred_name),
+                                     virulence_df$Preferred_name,
+                                     virulence_df$GeneID)
+
+p_virulence_hm <- pheatmap(virulence_matrix,
+                           scale = "row",
+                           color = viridis(100),
+                           treeheight_row = 15,
+                           treeheight_col = 15,
+                           main = "Pectobacterium Virulence Factors Expression",
+                           fontsize_row = 8)
+
+ggsave(filename = file.path(paper_dir, "Fig5_Heatmap_VirulenceGenes.tiff"),
+       plot = p_virulence_hm, width = 8, height = 10, dpi = DPI, compression = "lzw")
+```
+
+---
+
+## 7. Figure 6 — Volcano Plot: Transcriptional Regulators
+
+```{r fig6_regulators_volcano, fig.width=10, fig.height=8, warning=FALSE}
+tf_keywords <- "transcription factor|regulator|dna-binding"   # matched against lower-cased text
+
+regulator_volcano_data <- full_annotation %>%
+  mutate(
+    Is_Regulator = if_else(
+      str_detect(tolower(Description), tf_keywords) |
+        str_detect(tolower(Preferred_name), tf_keywords), "Yes", "No"),
+    Category = case_when(
+      Is_Regulator == "Yes" & !is.na(padj) & padj < 0.05 & log2FoldChange >  1 ~ "Regulator ↑ in Treatment",
+      Is_Regulator == "Yes" & !is.na(padj) & padj < 0.05 & log2FoldChange < -1 ~ "Regulator ↓ in Treatment",
+      Is_Regulator == "Yes"                                                      ~ "Regulator (NS)",
+      TRUE                                                                       ~ "Background"
+    ),
+    Label = if_else(
+      Is_Regulator == "Yes" & !is.na(padj) & padj < 0.05 & abs(log2FoldChange) > 1,
+      coalesce(
+        na_if(Preferred_name, "-"),
+        str_extract(GeneID, "WP_[0-9]+\\.[0-9]+"),
+        GeneID),
+      NA_character_)
+  )
+
+reg_colors <- c("Background"                = "#BDBDBD",
+                "Regulator (NS)"            = "#9ECAE1",
+                "Regulator ↑ in Treatment"   = "#D73027",
+                "Regulator ↓ in Treatment" = "#4575B4")
+reg_sizes  <- c("Background" = 1.2, "Regulator (NS)" = 2.5,
+                "Regulator ↑ in Treatment" = 3.5, "Regulator ↓ in Treatment" = 3.5)
+reg_alpha  <- c("Background" = 0.35, "Regulator (NS)" = 0.65,
+                "Regulator ↑ in Treatment" = 1, "Regulator ↓ in Treatment" = 1)
+
+p_tf_volcano <- ggplot(regulator_volcano_data, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = Category, size = Category, alpha = Category)) +
+  scale_color_manual(values = reg_colors, name = NULL) +
+  scale_size_manual( values = reg_sizes,  name = NULL) +
+  scale_alpha_manual(values = reg_alpha,  name = NULL) +
+  geom_text_repel(data = ~ filter(.x, !is.na(Label)),
+                  aes(label = Label),
+                  size = 3.5, fontface = "bold",
+                  box.padding = 0.5, point.padding = 0.3,
+                  max.overlaps = Inf,
+                  color = "black", bg.color = "white", bg.r = 0.12,
+                  segment.color = "grey50", segment.size = 0.4) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed",
+             color = "grey30", alpha = 0.6, linewidth = 0.5) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed",
+             color = "grey30", alpha = 0.6, linewidth = 0.5) +
+  labs(title    = "Global Transcriptional Regulators",
+       subtitle = "Red = higher in Treatment (log2FC > 0) · Blue = higher in Control (log2FC < 0)",
+       x = "log₂ Fold Change  (Treatment / Control)",
+       y = "-log₁₀(adj. p-value)") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title       = element_text(face = "bold", size = 15),
+        plot.subtitle    = element_text(size = 10, color = "grey40"),
+        panel.grid.minor = element_blank(),
+        legend.position  = "right")
+p_tf_volcano
+
+ggsave(filename = file.path(paper_dir, "Fig6_Volcano_Regulators.tiff"),
+       plot = p_tf_volcano, width = 10, height = 8, dpi = DPI, compression = "lzw")
+```
+
+---
+
+## Session information
+```{r session_info}
+sessionInfo()
+```

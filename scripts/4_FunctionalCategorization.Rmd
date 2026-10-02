@@ -1,0 +1,396 @@
+---
+title: "Functional Enrichment Analysis of DEGs"
+author: "López-Chablé Edgard Uriel"
+output:
+  pdf_document:
+    toc: true
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    toc_float: true
+    theme: readable
+    highlight: zenburn
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, message = FALSE, warning = FALSE}
+# Load all required packages
+library(clusterProfiler)
+library(enrichplot)
+library(dplyr)
+library(tidyr) 
+library(ggplot2)
+library(pathview)
+library(GO.db)
+library(readr)
+library(stringr)
+library(UpSetR)
+library(STRINGdb)
+library(magick)
+
+# TIFF output directory (created automatically)
+tiff_dir <- "../results/TIFFs/4_FunctionalCategorization"
+dir.create(tiff_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+## 1. Setup environment and directories
+
+We create folders to organize our functional enrichment outputs.
+```{r create_directories}
+out_dir <- "../results/enrichment"
+kegg_dir <- "../results/enrichment/kegg"
+adv_dir <- "../results/advanced_analysis"
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(kegg_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(adv_dir, showWarnings = FALSE, recursive = TRUE)
+
+```
+
+## 2. Import and prepare data
+
+### 2.1. Load functional metadata (eggNOG)
+We load the eggNOG annotation and build the `TERM2GENE` objects to map genes to their functions.
+
+```{r load_eggnog}
+# Load base annotation
+eggnog_data <- read.delim("../data/annotation.tsv")
+
+# GO Dictionary
+term2gene_go <- eggnog_data %>%
+  dplyr::select(GOs, X.query) %>%
+  tidyr::separate_rows(GOs, sep = ",") %>%
+  dplyr::filter(GOs != "" & GOs != "-" & !is.na(GOs)) %>%
+  dplyr::mutate(query = trimws(X.query), GOs = trimws(GOs)) %>% 
+  dplyr::select(GOs, X.query) %>%
+  as.data.frame()
+
+# Map GO IDs to descriptive terms
+vector_go <- Term(GOTERM)
+term2name_go <- data.frame(
+  GO_ID = as.character(names(vector_go)),
+  Term = as.character(unname(vector_go)),
+  stringsAsFactors = FALSE
+)
+
+# KEGG Dictionary (Filtered for 'map' metabolic pathways)
+term2gene_kegg <- eggnog_data %>%
+  dplyr::select(KEGG_Pathway, X.query) %>%
+  tidyr::separate_rows(KEGG_Pathway, sep = ",") %>%
+  dplyr::filter(KEGG_Pathway != "" & KEGG_Pathway != "-" & !is.na(KEGG_Pathway)) %>%
+  dplyr::filter(grepl("map", KEGG_Pathway)) %>% 
+  dplyr::mutate(query = trimws(X.query), KEGG_Pathway = trimws(KEGG_Pathway)) %>%
+  dplyr::select(KEGG_Pathway, X.query) %>%
+  as.data.frame()
+```
+
+### 2.2. Import Differentially Expressed Genes (DEGs)
+We extract and separate the significant genes found in our previous analysis.
+
+```{r load_degs, warning=FALSE}
+# Import significant results and clean IDs
+deg_table <- read_csv("../results/deg_Treatment_vs_Control.csv") %>% 
+  mutate(GeneID = str_extract(...1, "WP_[0-9]+\\.[0-9]+"))
+
+# Separate genes by regulation direction
+up_genes <- deg_table %>% filter(log2FoldChange > 0) %>% pull(GeneID) %>% trimws()
+down_genes <- deg_table %>% filter(log2FoldChange < 0) %>% pull(GeneID) %>% trimws()
+all_deg_ids <- trimws(deg_table$GeneID)
+```
+
+---
+
+## 3. Enrichment Analysis (ORA)
+
+### 3.1. Gene Ontology (GO)
+We test for over-represented biological processes in both up-regulated and down-regulated genes.
+
+```{r go_enrichment}
+# ORA: Up-regulated
+enrich_go_up <- enricher(gene = up_genes, 
+                         TERM2GENE = term2gene_go, 
+                         TERM2NAME = term2name_go,
+                         pAdjustMethod = "BH", 
+                         pvalueCutoff  = 0.1, 
+                         qvalueCutoff  = 0.1)
+
+# ORA: Down-regulated
+enrich_go_down <- enricher(gene = down_genes, 
+                           TERM2GENE = term2gene_go, 
+                           TERM2NAME = term2name_go,
+                           pAdjustMethod = "BH", 
+                           pvalueCutoff  = 0.1, 
+                           qvalueCutoff  = 0.1)
+```
+
+Create and export the Dotplots.
+```{r go_dotplots, fig.width=10, fig.height=7}
+p_go_up <- enrichplot::dotplot(enrich_go_up, showCategory = 15,
+                               title = "GO Enrichment (Up-regulated)") +
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 45)) +
+  scale_color_gradient(low = "#4575B4", high = "#D73027",
+                       name = "adj. p-value") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title   = element_text(face = "bold", size = 14),
+        axis.text.y  = element_text(size = 10),
+        axis.text.x  = element_text(size = 10),
+        legend.title = element_text(size = 10))
+
+p_go_down <- enrichplot::dotplot(enrich_go_down, showCategory = 15,
+                                 title = "GO Enrichment (Down-regulated)") +
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 45)) +
+  scale_color_gradient(low = "#4575B4", high = "#D73027",
+                       name = "adj. p-value") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title   = element_text(face = "bold", size = 14),
+        axis.text.y  = element_text(size = 10),
+        axis.text.x  = element_text(size = 10),
+        legend.title = element_text(size = 10))
+
+p_go_up
+p_go_down
+
+ggsave(filename = paste0(out_dir, "/dotplot_GO_UP.pdf"),   plot = p_go_up,   width = 12, height = 8)
+ggsave(filename = file.path(tiff_dir, "dotplot_GO_UP.tiff"),   plot = p_go_up,   width = 12, height = 8, dpi = 300, compression = "lzw")
+ggsave(filename = paste0(out_dir, "/dotplot_GO_DOWN.pdf"), plot = p_go_down, width = 12, height = 8)
+ggsave(filename = file.path(tiff_dir, "dotplot_GO_DOWN.tiff"), plot = p_go_down, width = 12, height = 8, dpi = 300, compression = "lzw")
+```
+
+### 3.2. KEGG Pathway Enrichment
+We check for affected metabolic pathways.
+
+```{r kegg_enrichment, fig.width=10, fig.height=7}
+enrich_kegg <- enricher(gene = all_deg_ids, 
+                        TERM2GENE = term2gene_kegg, 
+                        pAdjustMethod = "BH", 
+                        pvalueCutoff  = 0.1, 
+                        qvalueCutoff  = 0.1)
+
+p_kegg <- enrichplot::dotplot(enrich_kegg, showCategory = 15,
+                              title = "KEGG Pathway Enrichment") +
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 45)) +
+  scale_color_gradient(low = "#4575B4", high = "#D73027",
+                       name = "adj. p-value") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title   = element_text(face = "bold", size = 14),
+        axis.text.y  = element_text(size = 10),
+        axis.text.x  = element_text(size = 10),
+        legend.title = element_text(size = 10))
+
+p_kegg
+ggsave(filename = paste0(out_dir, "/dotplot_KEGG.pdf"),  plot = p_kegg, width = 12, height = 8)
+ggsave(filename = file.path(tiff_dir, "dotplot_KEGG.tiff"),  plot = p_kegg, width = 12, height = 8, dpi = 300, compression = "lzw")
+```
+
+---
+
+## 4. Automated KEGG Pathway Visualization (Pathview)
+
+We download the top 15 affected metabolic pathways and color them using our `log2FoldChange` values.
+
+```{r prepare_pathview}
+# Get KEGG Orthology (KO) IDs
+eggnog_ko <- eggnog_data %>%
+  dplyr::select(X.query, KEGG_ko) %>%
+  dplyr::filter(KEGG_ko != "" & KEGG_ko != "-") %>%
+  dplyr::mutate(KEGG_ko = gsub("ko:", "", KEGG_ko)) %>%
+  dplyr::mutate(KEGG_ko = sapply(strsplit(as.character(KEGG_ko), ","), `[`, 1))
+
+# Join with Fold Changes
+pathview_data <- deg_table %>%
+  dplyr::inner_join(eggnog_ko, by = c("GeneID" = "X.query")) %>%
+  dplyr::filter(!is.na(KEGG_ko) & !is.na(log2FoldChange))
+
+# Create a numeric vector for expression values
+fc_vector <- pathview_data$log2FoldChange
+names(fc_vector) <- pathview_data$KEGG_ko
+```
+
+Run the rendering loop.
+```{r render_pathview_loop, results='hide', message=FALSE, warning=FALSE}
+# Extract top 15 KEGG IDs and clean the prefix
+top_kegg_ids <- head(enrich_kegg@result$ID, 15)
+top_kegg_clean <- gsub("map", "", top_kegg_ids)
+
+# Temporarily change directory to save outputs neatly
+current_wd <- getwd()
+setwd(kegg_dir) 
+
+# 1. Loop to download and render each map (saved as PNGs)
+for (path_id in top_kegg_clean) {
+  message("Processing KEGG pathway: ", path_id)
+  
+  tryCatch({
+    # Round limit to nearest integer so legend labels don't overlap
+    fc_limit <- ceiling(max(abs(fc_vector)))
+    pathview(gene.data  = fc_vector,
+             pathway.id = path_id,
+             species    = "ko",
+             limit      = list(gene = fc_limit, cpd = 1),
+             kegg.native = TRUE) 
+  }, error = function(e) {
+    message("Skipped pathway ", path_id, " (Insufficient data or API constraint).")
+  })
+}
+
+# 2. Combine all maps into a single PDF safely
+library(magick)
+
+# Get all generated PNGs
+png_files <- list.files(pattern = "\\.pathview\\.png$")
+
+# SAFETY FILTER: Keep only files larger than 5KB to avoid "ImproperImageHeader" errors
+# from failed KEGG downloads (which are usually 0 bytes or tiny HTML error files).
+valid_png_files <- png_files[file.info(png_files)$size > 5000] 
+
+if(length(valid_png_files) > 0) {
+  message("Combining ", length(valid_png_files), " valid maps into a single PDF...")
+  
+  # Read only the valid, uncorrupted images
+  kegg_maps <- image_read(valid_png_files)
+  
+  # Write to a single PDF
+  image_write(kegg_maps, format = "pdf", path = "Top15_KEGG_Pathways_Consolidated.pdf")
+  
+  # Clean up all downloaded PNGs (both valid and corrupted) to keep the folder clean
+  file.remove(png_files) 
+} else {
+  message("No valid maps were generated to combine.")
+  # Clean up any leftover corrupted files
+  file.remove(png_files)
+}
+
+# Return to original working directory
+setwd(current_wd)
+```
+
+---
+
+## 5. Network Analysis (PPI - STRINGdb)
+We search for functional networks using orthologs confirmed by eggNOG.
+
+```{r string_network, warning=FALSE}
+# Significant genes (padj < 0.05) with a seed ortholog, capped at the 1001 lowest adjusted p-values
+ppi_data <- deg_table %>%
+  dplyr::inner_join(eggnog_data, by = c("GeneID" = "X.query")) %>%
+  dplyr::filter(padj < 0.05 & seed_ortholog != "") %>%
+  dplyr::arrange(padj) %>%
+  dplyr::slice_head(n = 1001) 
+
+string_ids <- ppi_data$seed_ortholog
+tax_id <- as.numeric(strsplit(string_ids[1], "\\.")[[1]][1])
+
+string_db <- STRINGdb$new(version = "11.5", 
+                          species = tax_id, 
+                          score_threshold = 700, 
+                          input_directory = out_dir)
+
+string_db$plot_network(string_ids)
+```
+
+---
+
+## 6. Specialized Plots
+
+### 6.1. UpSet Plot (Intersections)
+```{r upset_plot, fig.width=8, fig.height=6}
+intersect_list <- list(
+  "Up-regulated" = up_genes,
+  "Down-regulated" = down_genes
+)
+
+p_upset <- upset(fromList(intersect_list), 
+                 order.by = "freq", 
+                 mainbar.y.label = "Intersection Size", 
+                 sets.x.label = "Total Genes",
+                 text.scale = c(1.3, 1.3, 1, 1, 1.5, 1.2), 
+                 point.size = 3.5, 
+                 line.size = 1)
+
+print(p_upset)
+```
+
+### 6.2. Enrichment Map
+We use `emapplot` with a Fruchterman-Reingold layout (`fr`) which spreads similar terms
+more than `nicely`. Keeping only the top 12 terms avoids the central hairball typical when
+all enriched GO terms belong to the same super-family (e.g. purine/ATP biosynthesis).
+
+```{r emap_plots, fig.width=10, fig.height=9}
+# ── Up-regulated ──────────────────────────────────────────────────────────────
+enrich_go_up_sim <- pairwise_termsim(enrich_go_up)
+
+p_emap_up <- emapplot(enrich_go_up_sim,
+                      showCategory = 12,
+                      color        = "p.adjust",
+                      layout       = "fr") +   # Fruchterman-Reingold spreads clusters better
+  scale_color_gradient(low = "#1A9641", high = "#D73027",
+                       name = "adj. p-value") +
+  ggtitle("Enrichment Map — Up-regulated GO Terms") +
+  theme(plot.title  = element_text(face = "bold", size = 14, hjust = 0.5),
+        legend.text = element_text(size = 9))
+
+p_emap_up
+ggsave(filename = paste0(out_dir, "/emapplot_UP.pdf"),
+       plot = p_emap_up, width = 11, height = 9)
+ggsave(filename = file.path(tiff_dir, "emapplot_UP.tiff"),
+       plot = p_emap_up, width = 11, height = 9, dpi = 300, compression = "lzw")
+
+# ── Down-regulated ────────────────────────────────────────────────────────────
+if (!is.null(enrich_go_down) && nrow(enrich_go_down@result) > 1) {
+  enrich_go_down_sim <- pairwise_termsim(enrich_go_down)
+
+  p_emap_down <- emapplot(enrich_go_down_sim,
+                          showCategory = 12,
+                          color        = "p.adjust",
+                          layout       = "fr") +
+    scale_color_gradient(low = "#1A9641", high = "#D73027",
+                         name = "adj. p-value") +
+    ggtitle("Enrichment Map — Down-regulated GO Terms") +
+    theme(plot.title  = element_text(face = "bold", size = 14, hjust = 0.5),
+          legend.text = element_text(size = 9))
+
+  p_emap_down
+  ggsave(filename = paste0(out_dir, "/emapplot_DOWN.pdf"),
+         plot = p_emap_down, width = 11, height = 9)
+  ggsave(filename = file.path(tiff_dir, "emapplot_DOWN.tiff"),
+         plot = p_emap_down, width = 11, height = 9, dpi = 300, compression = "lzw")
+} else {
+  message("Not enough down-regulated GO terms to build an enrichment map.")
+}
+```
+
+---
+
+## 7. Prepare Data for Advanced Analysis (GSEA)
+
+To run tests like Gene Set Enrichment Analysis (GSEA) or upstream regulator checks, we need the full dataset, not just the filtered significant genes.
+
+```{r prep_advanced_data, warning=FALSE, message=FALSE}
+# Import the full DESeq2 results (no p-value filter)
+full_res <- read_csv("../results/deseq_results_Treatment_vs_Control.csv") %>%
+  mutate(GeneID = str_extract(...1, "WP_[0-9]+\\.[0-9]+")) %>%
+  filter(!is.na(GeneID) & !is.na(log2FoldChange))
+
+# Create a ranked list required for GSEA
+ranked_list <- full_res %>%
+  arrange(desc(log2FoldChange)) %>%
+  dplyr::select(GeneID, log2FoldChange)
+
+# Join the full data with eggNOG annotations
+full_annotation <- full_res %>%
+  left_join(eggnog_data, by = c("GeneID" = "X.query"))
+
+# Save objects for the next pipeline
+saveRDS(ranked_list, file = paste0(adv_dir, "/gsea_ranked_list.rds"))
+write_csv(full_annotation, file = paste0(adv_dir, "/full_annotated_results.csv"))
+```
+
+---
+
+## Session information
+```{r session_info}
+sessionInfo()
+```

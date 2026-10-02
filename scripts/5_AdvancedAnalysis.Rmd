@@ -1,0 +1,445 @@
+---
+title: "Advanced Analysis: GSEA, Virulence, and Networks"
+author: "López-Chablé Edgard Uriel"
+output: 
+  pdf_document:
+    toc: true
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    toc_float: true
+    theme: readable
+    highlight: zenburn
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, message = FALSE, warning = FALSE}
+# Load necessary packages
+library(clusterProfiler) # For enrichment analysis (GO/KEGG)
+library(enrichplot)      # To plot enrichment results
+library(tidyverse)       # For organizing and cleaning data
+library(ggplot2)         # For custom plots
+library(pheatmap)        # To create heatmaps
+library(viridis)         # Color palettes
+library(ggrepel)         # To prevent text overlap in plots
+library(KEGGREST)        # To get pathway names from the KEGG API
+library(STRINGdb)        # To get protein-protein interactions
+library(igraph)          # To build and analyze networks
+library(ggraph)          # To graph networks
+library(tidygraph)       # To modify networks
+
+# TIFF output directory (created automatically)
+tiff_dir <- "../results/TIFFs/5_AdvancedAnalysis"
+dir.create(tiff_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+## 1. Environment Setup
+
+We create folders to keep things organized. Analyses like KEGG create many images that can quickly clutter the main folder.
+
+```{r create_directories}
+adv_dir <- "../results/advanced_analysis"
+dir.create(adv_dir, showWarnings = FALSE, recursive = TRUE)
+
+```
+
+## 2. Data Import
+
+We load the ranked list (ordered by Log2FC) and the full database. GSEA needs the complete list of genes, not just the significant ones.
+
+```{r load_data}
+# Prepare the ranked list for GSEA 
+ranked_df <- readRDS("../results/advanced_analysis/gsea_ranked_list.rds") %>%
+  # Keep only the highest log2FC value for duplicate genes
+  group_by(GeneID) %>%
+  slice_max(order_by = abs(log2FoldChange), n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+gsea_vector <- ranked_df$log2FoldChange
+names(gsea_vector) <- ranked_df$GeneID
+gsea_vector <- sort(gsea_vector, decreasing = TRUE)
+
+# Load full differential expression data
+full_annotation <- read_csv("../results/advanced_analysis/full_annotated_results.csv")
+
+# Rebuild the KEGG dictionary from our eggNOG file
+eggnog_data <- read.delim("../data/annotation.tsv")
+
+term2gene_kegg <- eggnog_data %>%
+  dplyr::select(KEGG_Pathway, X.query) %>%
+  tidyr::separate_rows(KEGG_Pathway, sep = ",") %>%
+  dplyr::filter(grepl("map", KEGG_Pathway)) %>% 
+  dplyr::mutate(query = trimws(X.query), KEGG_Pathway = trimws(KEGG_Pathway)) %>%
+  dplyr::select(KEGG_Pathway, X.query) %>%
+  as.data.frame()
+```
+
+---
+
+## 3. Gene Set Enrichment Analysis (GSEA)
+
+GSEA looks at the whole ordered gene list to find if entire pathways are globally up-regulated or down-regulated.
+
+```{r run_gsea, warning=FALSE, message=FALSE}
+# Get official KEGG pathway names from the web
+kegg_names <- keggList("pathway")
+
+# Clean up the names to make them easier to read
+term2name_kegg <- data.frame(
+  PathwayID = sub("path:", "", names(kegg_names)), 
+  PathwayName = as.character(kegg_names)
+)
+term2name_kegg$PathwayName <- gsub(" - Reference pathway", "", term2name_kegg$PathwayName)
+
+# Run GSEA (seeded so that p-values are reproducible)
+set.seed(124)
+gsea_kegg <- GSEA(geneList = gsea_vector, 
+                  TERM2GENE = term2gene_kegg, 
+                  TERM2NAME = term2name_kegg, 
+                  pvalueCutoff = 0.05, 
+                  pAdjustMethod = "BH",
+                  minGSSize = 10,  
+                  maxGSSize = 500, 
+                  eps = 0,
+                  seed = TRUE)   # reproducible permutations (uses set.seed above)
+```
+
+### 3.1. Systemic Shifts (Ridgeplot)
+This plot shows how genes in the significant pathways are distributed.
+
+```{r ridgeplot, fig.width=10, fig.height=8}
+p_ridge <- ridgeplot(gsea_kegg, showCategory = 10) +
+  labs(title = "GSEA Ridgeplot: Systemic KEGG Pathway Shifts",
+       x = "Enrichment Distribution (Log2FC)") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 16))
+
+p_ridge
+ggsave(filename = paste0(adv_dir, "/gsea_ridgeplot.pdf"),  plot = p_ridge, width = 10, height = 8)
+ggsave(filename = file.path(tiff_dir, "gsea_ridgeplot.tiff"), plot = p_ridge, width = 10, height = 8, dpi = 300, compression = "lzw")
+```
+
+### 3.2. Top Enriched Pathway Plot
+
+```{r gsea_plot, fig.width=10, fig.height=8.5}
+# Pick a specific pathway (e.g., the second one) to avoid generic ones like Ribosome
+target_pathway_idx <- 2 
+top_gsea_pathway <- gsea_kegg@result$ID[target_pathway_idx] 
+
+p_gseaplot <- gseaplot2(gsea_kegg, 
+                        geneSetID = top_gsea_pathway, 
+                        title = paste("GSEA - Pathway:", gsea_kegg@result$Description[target_pathway_idx]), 
+                        pvalue_table = TRUE)
+
+pdf(paste0(adv_dir, "/target_pathway_gseaplot.pdf"), width = 10, height = 8.5)
+print(p_gseaplot)
+dev.off()
+tiff(file.path(tiff_dir, "target_pathway_gseaplot.tiff"), width = 10, height = 8.5,
+     units = "in", res = 300, compression = "lzw")
+print(p_gseaplot)
+dev.off()
+```
+
+---
+
+## 4. Virulence Profiling
+
+We filter the data to find plant cell wall degrading enzymes and secretion systems to see how the pathogen's attack tools change.
+
+```{r extract_virulence}
+# Keywords to find virulence factors.
+# Functional keywords are searched in the eggNOG description; the gene-family
+# prefixes (pel, peh, out, kdg) are matched only at the start of the gene name,
+# so that e.g. "out" does not capture every "outer membrane" protein.
+virulence_desc_kw <- "pectate lyase|cellulase|protease|secretion system"
+virulence_name_kw <- "^(pel|peh|out|kdg)"
+
+virulence_df <- full_annotation %>%
+  filter(padj < 0.05) %>% 
+  filter(str_detect(tolower(Description), virulence_desc_kw) | 
+         str_detect(tolower(Preferred_name), virulence_name_kw)) %>%
+  arrange(desc(abs(log2FoldChange)))
+
+virulence_genes <- virulence_df$GeneID
+message("Found ", length(virulence_genes), " significant virulence factors.")
+
+write_csv(virulence_df, paste0(adv_dir, "/virulence_factors_table.csv"))
+```
+
+### 4.1. Virulence Factors Heatmap
+
+```{r virulence_heatmap, fig.width=8, fig.height=10}
+# Load normalized counts and metadata
+load(file = "../results/dds_norm.RData") 
+metadatos <- read.csv(file = "../data/metadata_all.csv", row.names = 1)
+
+colnames(normcounts) <- metadatos$Replicates
+
+# Fix row names to match our GeneIDs
+rownames(normcounts) <- str_extract(rownames(normcounts), "WP_[0-9]+\\.[0-9]+")
+normcounts <- normcounts[!is.na(rownames(normcounts)), ]
+
+# Keep only the virulence genes
+virulence_matrix <- normcounts[virulence_genes, ]
+
+# Use common gene names (like pelA) if we have them
+rownames(virulence_matrix) <- ifelse(!is.na(virulence_df$Preferred_name), 
+                                     virulence_df$Preferred_name, 
+                                     virulence_df$GeneID)
+
+p_virulence_hm <- pheatmap(virulence_matrix, 
+                           scale = "row", 
+                           color = viridis(100),
+                           treeheight_row = 15,
+                           treeheight_col = 15,
+                           main = "Pectobacterium Virulence Factors Expression",
+                           fontsize_row = 8)
+
+ggsave(filename = paste0(adv_dir, "/heatmap_virulence.pdf"),  plot = p_virulence_hm, width = 8, height = 10)
+ggsave(filename = file.path(tiff_dir, "heatmap_virulence.tiff"), plot = p_virulence_hm, width = 8, height = 10, dpi = 300, compression = "lzw")
+```
+
+---
+
+## 5. Upstream Regulators Analysis
+
+We search for transcription factors and DNA-binding proteins that might be controlling these changes.
+
+```{r tf_volcano, fig.width=10, fig.height=8, warning=FALSE}
+tf_keywords <- "transcription factor|regulator|dna-binding"   # matched against lower-cased text
+
+# Four-category coloring: background / NS regulator / up-regulator / down-regulator
+volcano_data <- full_annotation %>%
+  mutate(
+    Is_Regulator = if_else(
+      str_detect(tolower(Description), tf_keywords) |
+        str_detect(tolower(Preferred_name), tf_keywords), "Yes", "No"),
+    Category = case_when(
+      Is_Regulator == "Yes" & !is.na(padj) & padj < 0.05 & log2FoldChange >  1 ~ "Regulator ↑ in Treatment",
+      Is_Regulator == "Yes" & !is.na(padj) & padj < 0.05 & log2FoldChange < -1 ~ "Regulator ↓ in Treatment",
+      Is_Regulator == "Yes"                                                      ~ "Regulator (NS)",
+      TRUE                                                                       ~ "Background"
+    ),
+    Label = if_else(
+      Is_Regulator == "Yes" & !is.na(padj) & padj < 0.05 & abs(log2FoldChange) > 1,
+      coalesce(
+        na_if(Preferred_name, "-"),          # use Preferred_name when available
+        str_extract(GeneID, "WP_[0-9]+\\.[0-9]+"),  # else short WP_ id
+        GeneID                               # last resort: full id
+      ),
+      NA_character_)                         # NA so ggrepel truly ignores non-labeled points
+  )
+
+# Palette: red = higher in Treatment (pos FC), blue = higher in Control (neg FC)
+reg_colors <- c("Background"              = "#BDBDBD",
+                "Regulator (NS)"          = "#9ECAE1",
+                "Regulator ↑ in Treatment"   = "#D73027",
+                "Regulator ↓ in Treatment" = "#4575B4")
+reg_sizes  <- c("Background"=1.2, "Regulator (NS)"=2.5,
+                "Regulator ↑ in Treatment"=3.5, "Regulator ↓ in Treatment"=3.5)
+reg_alpha  <- c("Background"=0.35, "Regulator (NS)"=0.65,
+                "Regulator ↑ in Treatment"=1, "Regulator ↓ in Treatment"=1)
+
+p_tf_volcano <- ggplot(volcano_data, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = Category, size = Category, alpha = Category)) +
+  scale_color_manual(values = reg_colors, name = NULL) +
+  scale_size_manual( values = reg_sizes,  name = NULL) +
+  scale_alpha_manual(values = reg_alpha,  name = NULL) +
+  geom_text_repel(data = ~ filter(.x, !is.na(Label)),
+                  aes(label = Label),
+                  size = 3.5, fontface = "bold",
+                  box.padding = 0.5, point.padding = 0.3,
+                  max.overlaps = Inf,
+                  color = "black", bg.color = "white", bg.r = 0.12,
+                  segment.color = "grey50", segment.size = 0.4) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed",
+             color = "grey30", alpha = 0.6, linewidth = 0.5) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed",
+             color = "grey30", alpha = 0.6, linewidth = 0.5) +
+  labs(title    = "Global Transcriptional Regulators",
+       subtitle = "Red = higher in Treatment (log2FC > 0) · Blue = higher in Control (log2FC < 0)",
+       x = "log₂ Fold Change  (Treatment / Control)",
+       y = "-log₁₀(adj. p-value)") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title       = element_text(face = "bold", size = 15),
+        plot.subtitle    = element_text(size = 10, color = "grey40"),
+        panel.grid.minor = element_blank(),
+        legend.position  = "right")
+
+p_tf_volcano
+ggsave(filename = paste0(adv_dir, "/volcano_regulators.pdf"),  plot = p_tf_volcano, width = 10, height = 8)
+ggsave(filename = file.path(tiff_dir, "volcano_regulators.tiff"), plot = p_tf_volcano, width = 10, height = 8, dpi = 300, compression = "lzw")
+```
+
+---
+
+## 6. Bioenergetics and Energy Targets
+
+We look for genes related to energy, like pumps and electron transport, which can be useful for lab experiments.
+
+```{r electrochemistry_targets}
+electro_keywords <- "atp synthase|efflux|pump|ion channel|cytochrome|electron transport|nadh dehydrogenase|proton|potassium|sodium|calcium|voltage"
+
+electro_genes <- full_annotation %>%
+  filter(padj < 0.05) %>% 
+  filter(str_detect(tolower(Description), electro_keywords) | 
+         str_detect(tolower(Preferred_name), electro_keywords) |
+         str_detect(tolower(GOs), "ion transport|atp biosynthetic")) %>% 
+  arrange(desc(log2FoldChange)) 
+
+message("Found ", nrow(electro_genes), " bioenergetic targets.")
+
+write_csv(electro_genes, paste0(adv_dir, "/electrochemistry_targets.csv"))
+```
+
+---
+
+## 7. Network Analysis (PPI Hubs & Clusters)
+
+We build a Protein-Protein Interaction (PPI) network using STRING's mapping tool. We apply a High-Confidence threshold (Score > 700) to remove noise and isolate distinct functional modules.
+
+```{r ppi_topology, warning=FALSE, message=FALSE}
+# 1. Prepare data for STRING mapping
+deg_network <- full_annotation %>%
+  filter(padj < 0.05) %>%
+  dplyr::select(GeneID, Preferred_name, seed_ortholog, log2FoldChange) %>%
+  mutate(search_name = coalesce(Preferred_name, GeneID)) %>%
+  group_by(search_name) %>%
+  slice_max(order_by = abs(log2FoldChange), n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# 2. Get Taxonomy ID and start STRINGdb (HIGH CONFIDENCE: 700)
+valid_orthologs <- deg_network$seed_ortholog[!is.na(deg_network$seed_ortholog) & deg_network$seed_ortholog != ""]
+tax_id <- as.numeric(strsplit(valid_orthologs[1], "\\.")[[1]][1])
+
+string_db <- STRINGdb$new(version = "11.5", species = tax_id, score_threshold = 700)
+
+# 3. Map genes securely
+mapped_genes <- string_db$map(as.data.frame(deg_network), "search_name", removeUnmappedRows = TRUE)
+
+# 4. Get interactions
+interactions <- string_db$get_interactions(mapped_genes$STRING_id)
+
+# 5. Build and clean the network graph
+ppi_graph <- graph_from_data_frame(d = interactions, directed = FALSE)
+ppi_graph <- simplify(ppi_graph)
+
+# 6. Process topology and extract Bottleneck Hubs
+if (vcount(ppi_graph) > 0) {
+  # Find clusters
+  # Louvain is stochastic: without a seed, module membership (and therefore the
+  # per-module hub selection below) varies between runs. Seed 124 reproduces the
+  # hub set shown in the published figure; 13 of the 15 hubs are stable across seeds.
+  set.seed(124)
+  communities <- cluster_louvain(ppi_graph)
+  ppi_graph <- set_vertex_attr(ppi_graph, "cluster", value = as.numeric(membership(communities)))
+
+  # Calculate importance metrics
+  ppi_graph <- set_vertex_attr(ppi_graph, "degree", value = degree(ppi_graph))
+  ppi_graph <- set_vertex_attr(ppi_graph, "betweenness", value = betweenness(ppi_graph))
+
+  # Add names back to nodes
+  node_metadata <- data.frame(STRING_id = V(ppi_graph)$name) %>%
+    left_join(mapped_genes, by = "STRING_id") %>%
+    distinct(STRING_id, .keep_all = TRUE)
+
+  ppi_graph <- set_vertex_attr(ppi_graph, "label", value = node_metadata$search_name)
+  ppi_graph <- set_vertex_attr(ppi_graph, "log2FC", value = node_metadata$log2FoldChange)
+
+  # STRATEGY CHANGE: Extract hubs based on Betweenness (Bottlenecks) 
+  # This labels critical bridges connecting different biological pathways.
+  top_hubs <- node_metadata %>%
+    mutate(Degree = V(ppi_graph)$degree, 
+           Betweenness = V(ppi_graph)$betweenness, 
+           Cluster = V(ppi_graph)$cluster) %>%
+    group_by(Cluster) %>%
+    slice_max(order_by = Betweenness, n = 3, with_ties = FALSE) %>%
+    ungroup() %>%
+    arrange(desc(Betweenness)) %>%
+    head(15)
+
+  write_csv(top_hubs, paste0(adv_dir, "/ppi_bottleneck_hubs.csv"))
+} else {
+  message("STRINGdb could not find any interactions above the 700 threshold.")
+}
+```
+
+### 7.1. Network Visualization (ggraph)
+We use `ggraph` with a Kamada-Kawai layout to separate distinct functional modules, while
+`ggrepel` highlights the bottleneck hubs identified above.
+
+```{r plot_network, fig.width=12, fig.height=12, warning=FALSE}
+library(ggraph)
+library(tidygraph)
+library(magick)
+
+if (vcount(ppi_graph) > 0) {
+  net_components <- components(ppi_graph)
+  if (max(net_components$csize) > 1) {
+    main_component <- induced_subgraph(ppi_graph, vids = which(net_components$membership == which.max(net_components$csize)))
+    tidy_net <- as_tbl_graph(main_component) %>%
+      mutate(
+        is_hub            = name %in% top_hubs$STRING_id,
+        hub_label         = ifelse(is_hub, label, NA),
+        clean_betweenness = replace_na(betweenness, 0),
+        max_bet           = max(clean_betweenness, na.rm = TRUE),
+        node_size         = ifelse(max_bet > 0, (clean_betweenness / max_bet) * 10 + 3, 5)
+      )
+
+    p_net <- ggraph(tidy_net, layout = "kk") +
+      geom_edge_link(color = "grey85", width = 0.5, alpha = 0.6) +
+      geom_node_point(aes(size = node_size, color = as.factor(cluster), alpha = is_hub)) +
+      scale_alpha_manual(values = c("TRUE" = 1, "FALSE" = 0.4), guide = "none") +
+      geom_node_text(aes(label = hub_label),
+                     repel         = TRUE,
+                     fontface      = "bold",
+                     size          = 5,
+                     box.padding   = 1,
+                     point.padding = 0.5,
+                     max.overlaps  = Inf,
+                     bg.color      = "white",
+                     bg.r          = 0.15,
+                     segment.color = "grey40",
+                     segment.size  = 0.6) +
+      scale_color_viridis_d(option = "viridis") +
+      scale_size_continuous(range = c(1.5, 11), guide = "none") +
+      labs(title    = "Protein-Protein Interaction Network",
+           subtitle = "Top 15 Bottleneck Hubs Highlighted (High Confidence STRING Score > 700)") +
+      theme_void() +
+      theme(legend.position = "none",
+            plot.title    = element_text(face = "bold", size = 18, hjust = 0.5),
+            plot.subtitle = element_text(size = 14, hjust = 0.5, color = "grey40"))
+
+    # Render ONCE to PDF, then convert to TIFF with magick (avoids triple-rendering)
+    pdf_path  <- paste0(adv_dir, "/ppi_high_confidence_network.pdf")
+    tiff_path <- file.path(tiff_dir, "ppi_high_confidence_network.tiff")
+
+    pdf(pdf_path, width = 12, height = 12)
+    print(p_net)
+    dev.off()
+
+    image_write(
+      image_read_pdf(pdf_path, density = 300),
+      path = tiff_path, format = "tiff", compression = "lzw"
+    )
+
+    print(p_net)
+
+  } else {
+    message("No connected components found to draw the plot.")
+  }
+} else {
+  message("Plot cancelled: the network is empty.")
+}
+```
+
+
+---
+
+## Session Information
+```{r session_info}
+sessionInfo()
+```

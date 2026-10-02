@@ -1,0 +1,49 @@
+cff-version: 1.2.0
+message: "If you use this code or data, please cite the article below."
+type: software
+title: "RNA-seq analysis of Pectobacterium aroidearum SM2 under VOC stress"
+abstract: >
+  Code, processed data and results for the transcriptomic analysis of
+  Pectobacterium aroidearum SM2 exposed to volatile organic compounds from
+  Kosakonia cowanii Cp1 (kallisto, DESeq2, functional enrichment, GSEA and
+  protein-protein interaction network analysis).
+authors:
+  - family-names: López Chablé
+    given-names: Edgard Uriel
+    affiliation: Universidad Autónoma de Querétaro
+repository-code: https://github.com/hierax00/pectobacterium-voc-transcriptomics
+license: MIT
+version: 1.0.0
+date-released: 2026-10-01
+keywords:
+  - RNA-seq
+  - transcriptomics
+  - Pectobacterium aroidearum
+  - volatile organic compounds
+  - DESeq2
+  - kallisto
+preferred-citation:
+  type: article
+  title: "Electrochemical impedance and transcriptomic analysis in Pectobacterium aroidearum SM2 under VOC's-stress during early colonization"
+  authors:
+    - family-names: Mena Navarro
+      given-names: Mayra Paola
+    - family-names: López Chablé
+      given-names: Uriel
+    - family-names: Reyes Betanzo
+      given-names: Claudia
+    - family-names: Arvizu Gómez
+      given-names: Jackeline Lizzeta
+    - family-names: Valenzuela Soto
+      given-names: José Humberto
+    - family-names: Ramos López
+      given-names: Miguel Ángel
+    - family-names: Amaro Reyes
+      given-names: Aldo
+    - family-names: Hernández Flores
+      given-names: José Luis
+    - family-names: Campos Guillén
+      given-names: Juan
+  journal: Microorganisms
+  year: 2026
+  status: submitted
