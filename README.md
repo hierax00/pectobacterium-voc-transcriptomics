@@ -1,4 +1,5 @@
 # RNA-seq analysis of *Pectobacterium aroidearum* SM2 under VOC stress
+[![DOI](https://zenodo.org/badge/1401076277.svg)](https://doi.org/10.5281/zenodo.23095575)
 
 Code, processed data and results for the transcriptomic analysis in:
 
